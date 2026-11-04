@@ -55,6 +55,9 @@ def main():
     parser.add_argument("--request", required=True)
     request = json.load(open(parser.parse_args().request, encoding="utf-8"))
     engine = request.get("engine")
+    if engine in ("seed-vc-v2", "seed-vc-v2-style"):
+        run_v2(request, convert_style=engine == "seed-vc-v2-style")
+        return
     if engine not in ("seed-vc-v1", "seed-vc-v1-f0"):
         fail("request", f"unknown engine '{engine}'")
     singing = engine == "seed-vc-v1-f0"
@@ -231,6 +234,148 @@ def main():
         result = torch.tensor(np.concatenate(chunks))[None, :].float()
         os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
         torchaudio.save(output, result.cpu(), sr)
+    progress(100)
+
+
+def resolve_target(path):
+    """Imports 'package.module.Name.attr' (the longest importable module prefix, then attributes)."""
+    import importlib
+    parts = path.split(".")
+    for cut in range(len(parts), 0, -1):
+        try:
+            target = importlib.import_module(".".join(parts[:cut]))
+        except ImportError:
+            continue
+        for name in parts[cut:]:
+            target = getattr(target, name)
+        return target
+    raise ImportError(f"cannot import '{path}'")
+
+
+def instantiate(node):
+    """A small stand-in for hydra.utils.instantiate (Seed-VC v2's config uses _target_ and _partial_ only)."""
+    if isinstance(node, list):
+        return [instantiate(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    if "_target_" not in node:
+        return {key: instantiate(value) for key, value in node.items()}
+    target = resolve_target(node["_target_"])
+    partial = bool(node.get("_partial_", False))
+    kwargs = {key: instantiate(value) for key, value in node.items() if key not in ("_target_", "_partial_")}
+    return functools.partial(target, **kwargs) if partial else target(**kwargs)
+
+
+def run_v2(request, convert_style):
+    """Seed-VC v2 (content: ASTRAL quantizers over HuBERT, timbre: CFM, accent and emotion: optional AR model), following modules/v2/vc_wrapper.py."""
+    params = request.get("params") or {}
+    paths = request.get("paths") or {}
+    cfm_path = need(request, "model")
+    output = request.get("output")
+    if not isinstance(output, str) or not output:
+        fail("request", "missing 'output'")
+    source = need(params, "source")
+    target = need(params, "voice_sample")
+    code = need(paths, "code", "dir")
+    ar_path = need(paths, "ar")
+    narrow_path = need(paths, "astral_narrow")
+    wide_path = need(paths, "astral_wide")
+    hubert_dir = need(paths, "hubert", "dir")
+    tokenizer_dir = need(paths, "tokenizer", "dir")
+    vocoder_dir = need(paths, "vocoder", "dir")
+    config_path = os.path.join(code, "configs", "v2", "vc_wrapper.yaml")
+    campplus_path = os.path.join(code, "campplus_cn_common.bin")
+    for required in (config_path, campplus_path):
+        if not os.path.isfile(required):
+            fail("request", f"{os.path.basename(required)} is missing from the Seed-VC code folder")
+
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    sys.path.insert(0, code)
+    # vc_wrapper.py imports pydub only to stream MP3 previews; this wrapper never streams, so a placeholder module is enough.
+    import types
+    pydub = types.ModuleType("pydub")
+
+    def no_mp3(*_args, **_kwargs):
+        raise RuntimeError("MP3 streaming is not used by tmac-seedvc")
+
+    pydub.AudioSegment = no_mp3
+    sys.modules.setdefault("pydub", pydub)
+    progress(2)
+
+    import numpy as np
+    import random as std_random
+    import torch
+    import soundfile
+    import yaml
+
+    torch.load = functools.partial(torch.load, weights_only=False)
+    seed = int(params.get("seed", 0))
+    if seed >= 0:
+        std_random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+    device = torch.device("cuda" if request.get("device") == "cuda" and torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+
+    config = yaml.safe_load(open(config_path, "r", encoding="utf-8"))
+    for key in ("content_extractor_narrow", "content_extractor_wide"):
+        config[key]["tokenizer_name"] = tokenizer_dir
+        config[key]["ssl_model_name"] = hubert_dir
+    config["vocoder"]["pretrained_model_name_or_path"] = vocoder_dir
+    config["vocoder"]["use_cuda_kernel"] = False
+    wrapper = instantiate(config)
+    progress(15)
+
+    strip = wrapper.strip_prefix
+    cfm = torch.load(cfm_path, map_location="cpu")
+    wrapper.cfm.load_state_dict(strip(cfm["net"]["cfm"], "module."), strict=False)
+    wrapper.cfm_length_regulator.load_state_dict(strip(cfm["net"]["length_regulator"], "module."), strict=False)
+    ar = torch.load(ar_path, map_location="cpu")
+    wrapper.ar.load_state_dict(strip(ar["net"]["ar"], "module."), strict=False)
+    wrapper.ar_length_regulator.load_state_dict(strip(ar["net"]["length_regulator"], "module."), strict=False)
+    wrapper.content_extractor_narrow.load_state_dict(torch.load(narrow_path, map_location="cpu"), strict=False)
+    wrapper.content_extractor_wide.load_state_dict(torch.load(wide_path, map_location="cpu"), strict=False)
+    wrapper.style_encoder.load_state_dict(torch.load(campplus_path, map_location="cpu"), strict=False)
+    wrapper.to(device)
+    wrapper.eval()
+    wrapper.setup_ar_caches(max_batch_size=1, max_seq_len=4096, dtype=dtype, device=device)
+    progress(30)
+
+    # The upstream generator collects the whole result only while streaming MP3; the chunk list it passes to _stream_wave_chunks is the result.
+    captured = {}
+    original = type(wrapper)._stream_wave_chunks
+
+    def collect(self, vc_wave, processed_frames, vc_mel, overlap_wave_len, generated_wave_chunks, previous_chunk, is_last_chunk, _stream):
+        captured["chunks"] = generated_wave_chunks
+        result = original(self, vc_wave, processed_frames, vc_mel, overlap_wave_len, generated_wave_chunks, previous_chunk, is_last_chunk, False)
+        progress(30 + 65 * (1.0 if is_last_chunk else min(0.95, len(generated_wave_chunks) / 20.0)))
+        return result
+
+    type(wrapper)._stream_wave_chunks = collect
+    with torch.no_grad():
+        for _ in wrapper.convert_voice_with_streaming(
+                source_audio_path=source,
+                target_audio_path=target,
+                diffusion_steps=int(params.get("diffusion_steps", 30)),
+                length_adjust=float(params.get("length_adjust", 1.0)),
+                intelligebility_cfg_rate=float(params.get("intelligibility_cfg_rate", 0.7)),
+                similarity_cfg_rate=float(params.get("similarity_cfg_rate", 0.7)),
+                top_p=float(params.get("top_p", 0.9)),
+                temperature=float(params.get("temperature", 1.0)),
+                repetition_penalty=float(params.get("repetition_penalty", 1.0)),
+                convert_style=convert_style,
+                anonymization_only=False,
+                device=device,
+                dtype=dtype,
+                stream_output=False):
+            pass
+    chunks = captured.get("chunks")
+    if not chunks:
+        fail("runtime", "Seed-VC v2 produced no audio")
+    os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+    soundfile.write(output, np.concatenate(chunks), wrapper.sr)
     progress(100)
 
 
